@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MAXFinder - SNCF API</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  .event {
+    position: absolute;
+    border-radius: 0.5rem;
+    padding: 2px 4px;
+    font-size: 0.75rem;
+    line-height: 1rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    color: white;
+    white-space: normal;
+    word-break: break-word;
+    cursor: pointer;
+    border: 1px solid rgba(0,0,0,0.3);
+  }
+  .tooltip {
+    position: absolute;
+    z-index: 50;
+    background: rgba(0,0,0,0.85);
+    color: white;
+    padding: 6px 8px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    max-width: 200px;
+    white-space: pre-line;
+    display: none;
+  }
+  .sticky-header {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background-color: white;
+  }
+  .legend-btn {
+    text-align: left;
+    cursor: pointer;
+    color: white;
+    border-radius: 0.25rem;
+    padding: 0.25rem 0.5rem;
+    display: block;
+    width: 100%;
+  }
+</style>
+</head>
+<body class="bg-gray-50 p-4">
+<h2 class="text-2xl font-semibold mb-4">MAXFinder - SNCF API</h2>
+
+<div class="mb-4">
+  <input id="searchInput" type="text"
+         placeholder="Entrez au moins 2 gares séparées par des virgules (ex: PARIS, RENNES)"
+         class="w-full p-2 border rounded shadow-sm" />
+</div>
+<!-- <div class="mb-4 flex gap-2 items-center"> -->
+  <!-- <label class="text-sm">Du:</label> -->
+  <!-- <input id="startDate" type="date" class="border rounded p-1 text-sm"/> -->
+  <!-- <label class="text-sm">Au:</label> -->
+  <!-- <input id="endDate" type="date" class="border rounded p-1 text-sm"/> -->
+<!-- </div> -->
+
+<div id="progressContainer" class="mb-4 text-gray-600"></div>
+<div id="legendContainer" class="mb-4 flex flex-col gap-1"></div>
+<div id="calendarContainer" class="space-y-8"></div>
+<div id="tooltip" class="tooltip"></div>
+
+<script>
+const calendarContainer = document.getElementById('calendarContainer');
+const tooltip = document.getElementById('tooltip');
+const searchInput = document.getElementById('searchInput');
+const progressContainer = document.getElementById('progressContainer');
+const legendContainer = document.getElementById('legendContainer');
+
+let routeColors = {};
+let visibleCombos = new Set();
+let stationOrder = [];
+
+// --- couleur stable à partir d'une string
+function stringToHslColor(str, baseHue, saturation=70, lightness=50) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
+  const h = (Math.abs(hash) % 80) + baseHue; // augmentation de la variation à 80°
+  return `hsl(${h}, ${saturation}%, ${lightness}%)`;
+}
+
+
+// --- tooltip
+function showTooltip(content, x, y) {
+  tooltip.textContent = content;
+  tooltip.style.left = x + 'px';
+  tooltip.style.top = y + 'px';
+  tooltip.style.display = 'block';
+}
+function hideTooltip() { tooltip.style.display = 'none'; }
+
+// --- transform SNCF data
+function transformData(data) {
+  return data.map(tr => {
+    const start = new Date(tr.date + 'T' + tr.heure_depart);
+    const end = new Date(tr.date + 'T' + tr.heure_arrivee);
+    const combo = tr.origine + '→' + tr.destination;
+
+    const fromIndex = stationOrder.indexOf(tr.origine.toUpperCase().replace(" (INTRAMUROS)",""));
+    const toIndex = stationOrder.indexOf(tr.destination.toUpperCase().replace(" (INTRAMUROS)",""));
+    let direction = "aller";
+    if (fromIndex > toIndex) direction = "retour";
+
+const baseHue = direction === "aller" ? 200 : 20;
+const variation = (Math.abs([...combo].reduce((a,c)=>a+c.charCodeAt(0),0)) % 50) - 25; // ±25° variation
+routeColors[combo] = routeColors[combo] || stringToHslColor(combo, baseHue + variation);
+
+    return {
+      start,
+      end,
+      from: tr.origine,
+      to: tr.destination,
+      train_no: tr.train_no,
+      entity: tr.entity,
+      axe: tr.axe,
+      od_happy_card: tr.od_happy_card,
+      color: routeColors[combo],
+      direction
+    };
+  });
+}
+
+let allTransformedEvents = []; // stocke tous les trains transformés
+
+function applyLocalDateFilterAndRender() {
+  const startInput = document.getElementById('startDate').value;
+  const endInput = document.getElementById('endDate').value;
+  const start = startInput ? new Date(startInput) : null;
+  const end = endInput ? new Date(endInput) : null;
+
+  const filtered = allTransformedEvents.filter(ev => {
+    if (start && ev.start < start) return false;
+    if (end && ev.start > end) return false;
+    return true;
+  });
+
+  renderWithVisibilityFilter(filtered);
+}
+
+// --- normalisation des gares avec wildcard '*'
+function normalizeStations(events, stationOrder) {
+  // créer un mapping stationWildcard => stationStandard
+  const mapping = {};
+  stationOrder.forEach(s=>{
+    if(s.endsWith('*')){
+      const prefix = s.slice(0,-1).toUpperCase();
+      events.forEach(ev=>{
+        const fromClean = ev.from.toUpperCase();
+        const toClean = ev.to.toUpperCase();
+        if(fromClean.startsWith(prefix)) mapping[ev.from] = s.slice(0,-1); // garde le prefix comme standard
+        if(toClean.startsWith(prefix)) mapping[ev.to] = s.slice(0,-1);
+      });
+    }
+  });
+
+  // appliquer le mapping
+  return events.map(ev=>{
+    return {
+      ...ev,
+      from: mapping[ev.from] || ev.from,
+      to: mapping[ev.to] || ev.to
+    };
+  });
+}
+
+// --- unique trains
+function uniqueTrains(events) {
+  const seen = new Set();
+  return events.filter(ev => {
+    const key = `${ev.from}-${ev.to}-${ev.start.toISOString()}-${ev.end.toISOString()}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// --- filtre ±30 min par combo
+function filterByTimeWindow(events, windowMinutes = 30) {
+  const kept = [];
+  const windowMs = windowMinutes * 60000;
+  const sorted = events.slice().sort((a,b)=>a.start-b.start);
+
+  for(const ev of sorted){
+    const key = ev.from+'→'+ev.to;
+    const conflict = kept.some(k=>
+      (k.from+'→'+k.to)===key &&
+      Math.abs(k.start-ev.start) <= windowMs
+    );
+    if(!conflict) kept.push(ev);
+  }
+  return kept;
+}
+
+// --- legend
+function updateLegend(events) {
+  const combos = [...new Set(events.map(ev=>ev.from+'→'+ev.to))];
+  legendContainer.innerHTML = '';
+  visibleCombos.clear();
+  combos.forEach(combo=>{
+    visibleCombos.add(combo);
+    const color = routeColors[combo];
+    const btn = document.createElement('button');
+    btn.className = 'legend-btn';
+    btn.style.backgroundColor = color;
+    btn.textContent = combo;
+    btn.onclick = ()=>{
+      if(visibleCombos.has(combo)) visibleCombos.delete(combo);
+      else visibleCombos.add(combo);
+      renderWithVisibilityFilter(events);
+      updateLegendButtonStyles();
+    };
+    legendContainer.appendChild(btn);
+  });
+  updateLegendButtonStyles();
+}
+function updateLegendButtonStyles(){
+  Array.from(legendContainer.children).forEach(btn=>{
+    const combo = btn.textContent;
+    btn.style.opacity = visibleCombos.has(combo)?'1':'0.4';
+  });
+}
+
+// --- render
+function renderWithVisibilityFilter(events){
+  const filteredEvents = events.filter(ev => visibleCombos.has(ev.from+'→'+ev.to));
+  renderCalendar(filteredEvents);
+}
+
+function renderCalendar(events){
+  if(!events.length){
+    calendarContainer.innerHTML='<div class="text-gray-500">Aucun trajet trouvé</div>';
+    return;
+  }
+
+  const weeks = {};
+  events.forEach(ev=>{
+    const monday = new Date(ev.start);
+    monday.setDate(monday.getDate()-((monday.getDay()+6)%7));
+    monday.setHours(0,0,0,0);
+    const key = monday.toISOString().slice(0,10);
+    if(!weeks[key]) weeks[key]={monday,events:[]};
+    weeks[key].events.push(ev);
+  });
+
+  calendarContainer.innerHTML='';
+  Object.values(weeks).sort((a,b)=>a.monday-b.monday).forEach(week=>{
+    const wrapper = document.createElement('div');
+    wrapper.className='bg-white border rounded shadow-sm overflow-hidden';
+
+    // header
+    const header = document.createElement('div');
+    header.className='flex items-stretch border-b sticky-header';
+    const timeLabel = document.createElement('div');
+    timeLabel.className='w-16 p-2 text-center text-xs text-gray-600';
+    timeLabel.textContent='Time';
+    header.appendChild(timeLabel);
+
+    const daysHeader = document.createElement('div');
+    daysHeader.className='flex-1 grid grid-cols-7';
+    const days=[];
+    for(let i=0;i<7;i++){
+      const d = new Date(week.monday);
+      d.setDate(week.monday.getDate()+i);
+      days.push(d);
+      const div = document.createElement('div');
+      div.className='p-2 text-xs border-l text-center';
+      div.innerHTML=`<div class="font-medium">${d.toLocaleDateString(undefined,{weekday:'short'})}</div>
+                     <div class="text-gray-500">${d.toLocaleDateString()}</div>
+                     <div class="text-[10px] text-gray-400">Aller | Retour</div>`;
+      daysHeader.appendChild(div);
+    }
+    header.appendChild(daysHeader);
+    wrapper.appendChild(header);
+
+    // heures min/max
+    let minHour=24,maxHour=0;
+    week.events.forEach(ev=>{minHour=Math.min(minHour,ev.start.getHours());maxHour=Math.max(maxHour,ev.end.getHours());});
+    minHour=Math.max(0,minHour-1); maxHour=Math.min(23,maxHour+1);
+
+    const timetable=document.createElement('div');
+    timetable.className='relative';
+    timetable.style.height=((maxHour-minHour+1)*60)+'px';
+
+    // colonne temps
+    const timeColumn=document.createElement('div');
+    timeColumn.className='absolute left-0 top-0 bottom-0 w-16 border-r bg-gray-50';
+    for(let h=minHour;h<=maxHour;h++){
+      const div=document.createElement('div');
+      div.style.height='60px';
+      div.className='text-xs p-1 border-t';
+      div.textContent=String(h).padStart(2,'0')+':00';
+      timeColumn.appendChild(div);
+    }
+    timetable.appendChild(timeColumn);
+
+    // colonnes jours
+    const dayColumns=document.createElement('div');
+    dayColumns.className='absolute left-16 right-0 top-0 bottom-0 grid grid-cols-7';
+    days.forEach(d=>{
+      const col=document.createElement('div');
+      col.className='relative border-l border-t grid grid-cols-2'; // split aller/retour
+
+      ["aller","retour"].forEach(direction=>{
+        const subCol=document.createElement('div');
+        subCol.className='relative';
+
+        // grille horaire
+        for(let h=minHour;h<=maxHour;h++){
+          const line=document.createElement('div');
+          line.style.top=(h-minHour)*60+'px';
+          line.className='absolute left-0 right-0 h-px bg-gray-100';
+          subCol.appendChild(line);
+        }
+
+        // événements du jour et direction
+        let eventsDay = week.events.filter(ev=>
+          ev.start.toDateString()===d.toDateString() && ev.direction===direction
+        ).sort((a,b)=>a.start-b.start);
+
+        // gestion des chevauchements (Google Calendar style)
+        let positioned = [];
+        eventsDay.forEach(ev=>{
+          let overlaps = positioned.filter(e=>(!(e.end<=ev.start || e.start>=ev.end)));
+          let colIndex = 0;
+          let used = overlaps.map(e=>e.colIndex);
+          while(used.includes(colIndex)) colIndex++;
+          ev.colIndex = colIndex;
+          overlaps.push(ev);
+          positioned.push(ev);
+        });
+
+        let maxCol = 0;
+        if(positioned.length) maxCol = Math.max(...positioned.map(e=>e.colIndex));
+
+        positioned.forEach(ev=>{
+          const start=ev.start,end=ev.end;
+          const top = ((start.getHours()+start.getMinutes()/60)-minHour)*60;
+          const height = (end-start)/60000;
+
+          const div=document.createElement('div');
+          div.className='event';
+          div.style.backgroundColor = ev.color;
+          div.style.top=top+'px';
+          div.style.height=Math.max(20,height)+'px';
+          div.style.width = `calc(${100/(maxCol+1)}% - 4px)`;
+          div.style.left = `calc(${ev.colIndex*100/(maxCol+1)}% + 2px)`;
+
+          const fromClean = ev.from.replace(' (intramuros)','');
+          const toClean = ev.to.replace(' (intramuros)','');
+          const durationStr = `${Math.floor((end-start)/60000/60)}h ${Math.round((end-start)/60000%60)}m`;
+          div.innerHTML=`<div class="font-semibold">${fromClean} → ${toClean}</div>
+                         <div>${start.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} - 
+                         ${end.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} (${durationStr})</div>`;
+
+          const tooltipContent=`Train ${ev.train_no} (${ev.entity||'N/A'}, ${ev.axe||'N/A'})
+From: ${fromClean}
+To: ${toClean}
+Departure: ${start.toLocaleTimeString()}
+Arrival: ${end.toLocaleTimeString()}
+Duration: ${durationStr}
+Happy Card: ${ev.od_happy_card}`;
+          div.onclick=(e)=>{e.stopPropagation(); showTooltip(tooltipContent,e.pageX+10,e.pageY+10);};
+          subCol.appendChild(div);
+        });
+
+        col.appendChild(subCol);
+      });
+
+      dayColumns.appendChild(col);
+    });
+
+    timetable.appendChild(dayColumns);
+    wrapper.appendChild(timetable);
+    calendarContainer.appendChild(wrapper);
+  });
+}
+
+// --- SNCF API fetch pagination
+async function fetchSNCFData(origine,destination){
+  const limit=100;
+  let offset=0,allResults=[],totalCount=0;
+  do{
+    const url=`https://data.sncf.com/api/explore/v2.1/catalog/datasets/tgvmax/records?where=(startswith(origine%2C%22${origine}%22)%20and%20startswith(destination%2C%22${destination}%22))%20or%20(startswith(destination%2C%22${origine}%22)%20and%20startswith(origine%2C%22${destination}%22))&limit=${limit}&offset=${offset}&refine=od_happy_card%3A%22OUI%22`;
+    const res=await fetch(url);
+    const data=await res.json();
+    const results = data.results||[];
+    totalCount = data.total_count||0;
+    allResults.push(...results);
+    offset += limit;
+    progressContainer.textContent=`Récupération ${origine} ↔ ${destination} : ${Math.min(allResults.length,totalCount)} / ${totalCount}`;
+  }while(allResults.length<totalCount);
+  return allResults.map(r=>({
+    date: r.date,
+    heure_depart: r.heure_depart,
+    heure_arrivee: r.heure_arrivee,
+    origine: r.origine,
+    destination: r.destination,
+    train_no: r.train_no,
+    od_happy_card: r.od_happy_card,
+    entity: r.entity,
+    axe: r.axe
+  }));
+}
+
+// --- recherche
+async function searchTrains() {
+  const input = searchInput.value;
+  stationOrder = input.split(',').map(s => s.trim().toUpperCase()).filter(s => s.length > 0);
+  if (stationOrder.length < 2) {
+    calendarContainer.innerHTML = '<div class="text-gray-500">Veuillez entrer au moins 2 gares</div>';
+    progressContainer.textContent = '';
+    legendContainer.innerHTML = '';
+    return;
+  }
+
+  // Préparer les stations pour la recherche SNCF
+  const cleanStations = stationOrder.map(s => s.replace('*', ''));
+
+  // Créer toutes les combinaisons
+  const combos = [];
+  for (let i = 0; i < cleanStations.length; i++) {
+    for (let j = i + 1; j < cleanStations.length; j++) combos.push([cleanStations[i], cleanStations[j]]);
+  }
+
+  const allEvents = [];
+  let completed = 0;
+
+  for (const [origine, destination] of combos) {
+    try {
+      const res = await fetchSNCFData(origine, destination);
+      // fusion des gares avec '*' : si stationOrder contient '*', on regroupe ici
+    res.forEach(r => {
+  let rOrigine = r.origine;
+  let rDestination = r.destination;
+
+  // Normaliser uniquement si la station a un '*'
+  const wildcardOrig = stationOrder.find(s => s.endsWith('*') && r.origine.startsWith(s.replace('*', '')));
+  const wildcardDest = stationOrder.find(s => s.endsWith('*') && r.destination.startsWith(s.replace('*', '')));
+
+  if (wildcardOrig) rOrigine = wildcardOrig;
+  if (wildcardDest) rDestination = wildcardDest;
+
+  allEvents.push({
+    ...r,
+    origine: rOrigine,
+    destination: rDestination
+  });
+});
+
+    } catch (e) {
+      console.error("Erreur fetch", origine, destination, e);
+    }
+    completed++;
+    progressContainer.textContent = `Combos traités : ${completed}/${combos.length}`;
+
+    let transformedEvents = transformData(allEvents);
+    let filteredEvents = filterByTimeWindow(uniqueTrains(transformedEvents), 30);
+    updateLegend(filteredEvents);
+    renderWithVisibilityFilter(filteredEvents);
+  }
+
+  progressContainer.textContent = 'Chargement terminé';
+}
+
+
+searchInput.addEventListener('change',searchTrains);
+document.getElementById('startDate').addEventListener('change', applyLocalDateFilterAndRender);
+document.getElementById('endDate').addEventListener('change', applyLocalDateFilterAndRender);
+document.addEventListener('click',()=>{tooltip.style.display='none';});
+</script>
+</body>
+</html>
+
